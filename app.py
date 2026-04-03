@@ -1,5 +1,7 @@
 import os
-from flask import Flask, request, jsonify, send_from_directory
+import cloudinary
+import cloudinary.uploader
+from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -7,15 +9,20 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 CORS(app)  # Enable CORS for mobile app access
 
-# Configure SQLite Database
-basedir = os.path.abspath(os.path.dirname(__file__))
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'pigs.db')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+cloudinary.config(
+    cloud_name=os.environ.get("CLOUD_NAME"),
+    api_key=os.environ.get("API_KEY"),
+    api_secret=os.environ.get("API_SECRET")
+)
 
-# Upload folder configuration
-UPLOAD_FOLDER = os.path.join(basedir, 'uploads')
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)  # Auto-create uploads directory
+# Configure PostgreSQL Database
+db_url = os.environ.get("DATABASE_URL")
+
+if db_url and db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Initialize SQLAlchemy
 db = SQLAlchemy(app)
@@ -34,13 +41,6 @@ class Pig(db.Model):
     image = db.Column(db.String(250), nullable=False)  # filename
 
     def to_dict(self):
-        # Include full URL reference for the image based on request host URL
-        # host_url gives something like "http://127.0.0.1:5000/" or "http://<ip>:5000/"
-        # We'll return just the relative path as per typical setups, 
-        # but to have 'full image URL' we can build it conditionally or return a relative URL 
-        # and let mobile prepend the base URL. For simplicity and robustness, returning a relative path.
-        image_url = f"/uploads/{self.image}" if self.image else None
-        
         return {
             'id': self.id,
             'pig_name': self.pig_name,
@@ -51,7 +51,7 @@ class Pig(db.Model):
             'vaccinated': self.vaccinated,
             'vaccine_date': self.vaccine_date,
             'breed': self.breed,
-            'image': image_url
+            'image': self.image
         }
 
 # Create database tables automatically
@@ -95,12 +95,9 @@ def upload_pig():
         if existing_pig:
             return jsonify({'error': 'pig_id already exists'}), 409
 
-        # 5. Save the image safely
-        filename = secure_filename(image_file.filename)
-        # Prepend the pig_id to the filename to avoid collisions between multiple uploads having the same filename
-        unique_filename = f"{pig_id}_{filename}"
-        image_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-        image_file.save(image_path)
+        # 5. Save the image to Cloudinary
+        result = cloudinary.uploader.upload(image_file)
+        image_url = result["secure_url"]
 
         # 6. Store metadata in database
         new_pig = Pig(
@@ -112,7 +109,7 @@ def upload_pig():
             vaccinated=vaccinated,
             vaccine_date=vaccine_date,
             breed=breed,
-            image=unique_filename
+            image=image_url
         )
         db.session.add(new_pig)
         db.session.commit()
@@ -133,11 +130,7 @@ def get_pigs():
         # Return full image URL in JSON for each pig
         pig_list = []
         for pig in pigs:
-            pig_dict = pig.to_dict()
-            # If you specifically need the absolute full URL (e.g., http://host:5000/uploads/file.png)
-            if pig_dict['image']:
-                pig_dict['image'] = request.host_url.rstrip('/') + pig_dict['image']
-            pig_list.append(pig_dict)
+            pig_list.append(pig.to_dict())
             
         return jsonify(pig_list), 200
     except Exception as e:
@@ -172,11 +165,8 @@ def update_pig(pig_id):
         if 'image' in request.files:
             image_file = request.files['image']
             if image_file.filename != '':
-                filename = secure_filename(image_file.filename)
-                unique_filename = f"{pig.pig_id}_{filename}"
-                image_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-                image_file.save(image_path)
-                pig.image = unique_filename
+                result = cloudinary.uploader.upload(image_file)
+                pig.image = result["secure_url"]
 
         db.session.commit()
         return jsonify({'message': 'Pig updated successfully', 'pig': pig.to_dict()}), 200
@@ -207,19 +197,12 @@ def search_pigs():
 
         pig_list = []
         for pig in results:
-            pig_dict = pig.to_dict()
-            if pig_dict['image']:
-                pig_dict['image'] = request.host_url.rstrip('/') + pig_dict['image']
-            pig_list.append(pig_dict)
+            pig_list.append(pig.to_dict())
 
         return jsonify(pig_list), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Endpoint to serve images
-@app.route('/uploads/<filename>', methods=['GET'])
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 if __name__ == '__main__':
     # Run the server on 0.0.0.0 so it's accessible from other devices on the network
